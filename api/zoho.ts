@@ -1,3 +1,12 @@
+import { supabaseServer } from './_supabaseServer';
+import { createRequestLogger, sanitizeLogContext } from './utils/logger';
+import { 
+  getRateLimitKey, 
+  checkRateLimit, 
+  createRateLimitResponse, 
+  RATE_LIMITS,
+  cleanupRateLimitStore 
+} from './utils/rateLimiter';
 
 export const config = {
   runtime: 'edge',
@@ -32,21 +41,51 @@ async function getOAuthToken(params: URLSearchParams, apiDomain: string) {
   return data;
 }
 
-import { supabaseServer } from './_supabaseServer';
-
 export default async function handler(req: Request) {
+  const { requestId, logger, logResponse, logError } = createRequestLogger(req);
+  
+  // Periodic cleanup (every 100th request)
+  if (Math.random() < 0.01) {
+    cleanupRateLimitStore();
+  }
+
   if (req.method !== 'POST') {
+    logResponse(405);
     return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405 });
   }
 
   try {
     const body = await req.json();
-    const { action, apiDomain, clientId, clientSecret, refreshToken, grantToken, redirectUri } = body;
+    const { action, apiDomain, clientId, clientSecret, refreshToken, grantToken, redirectUri, userId } = body;
+    
+    logger.debug('Request body received', sanitizeLogContext({
+      action,
+      apiDomain,
+      clientId: clientId ? '[PROVIDED]' : '[ENV]',
+      clientSecret: clientSecret ? '[PROVIDED]' : '[ENV]',
+      userId: userId ? '[PROVIDED]' : undefined,
+      templateId: body.templateId?.slice(0, 8),
+    }));
+
+    // Apply rate limiting
+    const rateLimitKey = getRateLimitKey(req, userId);
+    const rateLimitCheck = checkRateLimit(rateLimitKey, RATE_LIMITS.ZOHO_API);
+    
+    if (!rateLimitCheck.allowed) {
+      logger.warn('Rate limit exceeded', {
+        limitKey: rateLimitKey,
+        retryAfter: rateLimitCheck.retryAfter,
+      });
+      return createRateLimitResponse(rateLimitCheck);
+    }
+
     const resolvedClientId = clientId || process.env.ZOHO_CLIENT_ID;
     const resolvedClientSecret = clientSecret || process.env.ZOHO_CLIENT_SECRET;
 
     // --- CASE 1: Initial OAuth Exchange (Grant Token -> Refresh Token) ---
     if (action === 'exchange') {
+      logger.info('Processing OAuth token exchange');
+      
       const params = new URLSearchParams();
       params.append('code', grantToken);
       params.append('client_id', resolvedClientId || '');
@@ -57,28 +96,42 @@ export default async function handler(req: Request) {
       
       try {
         const data = await getOAuthToken(params, apiDomain || 'sign.zoho.com');
+        logger.info('OAuth token exchange successful');
+        logResponse(200, { action: 'exchange' });
         return new Response(JSON.stringify(data), { status: 200 });
       } catch (e: any) {
+        logger.error('OAuth token exchange failed', e);
+        logResponse(400, { action: 'exchange' });
         return new Response(JSON.stringify({ error: e.message }), { status: 400 });
       }
     }
 
     // --- CASE 2: Standard Sign Request ---
-    const { templateId, signer, roleName, isTest, accessToken: providedAccessToken, clientId: providedClientId, clientSecret: providedClientSecret, userId } = body;
+    const { templateId, signer, roleName, isTest, accessToken: providedAccessToken, clientId: providedClientId, clientSecret: providedClientSecret } = body;
 
     let effectiveClientId = providedClientId || resolvedClientId;
     let effectiveClientSecret = providedClientSecret || resolvedClientSecret;
     let effectiveRefreshToken = refreshToken;
     let effectiveApiDomain = apiDomain;
 
+    logger.debug('Resolving credentials', {
+      clientIdProvided: !!providedClientId,
+      refreshTokenProvided: !!refreshToken,
+      userId: userId ? '[PROVIDED]' : undefined,
+    });
+
     // If creds not provided, try to load from Supabase by userId
     if ((!effectiveClientId || !effectiveClientSecret || !effectiveRefreshToken) && userId) {
+      logger.debug('Loading credentials from Supabase', { userId });
       const { data: credRow, error: credErr } = await supabaseServer
         .from('user_credentials')
         .select('zoho_client_id,zoho_client_secret,zoho_refresh_token,api_domain')
         .eq('user_id', userId)
         .maybeSingle();
-      if (!credErr && credRow) {
+      if (credErr) {
+        logger.error('Failed to load credentials from Supabase', credErr);
+      } else if (credRow) {
+        logger.info('Credentials loaded from Supabase');
         effectiveClientId = effectiveClientId || credRow.zoho_client_id;
         effectiveClientSecret = effectiveClientSecret || credRow.zoho_client_secret;
         effectiveRefreshToken = effectiveRefreshToken || credRow.zoho_refresh_token;
@@ -87,15 +140,26 @@ export default async function handler(req: Request) {
     }
 
     if (!providedAccessToken && (!effectiveClientId || !effectiveClientSecret || !effectiveRefreshToken)) {
+      const errorMsg = 'Missing credentials: clientId/clientSecret must be set on the server and refreshToken provided unless you pass accessToken.';
+      logger.error(errorMsg);
+      logResponse(400, { reason: 'missing_credentials' });
       return new Response(JSON.stringify({ 
         error: 'Missing credentials', 
-        message: 'clientId/clientSecret must be set on the server and refreshToken provided unless you pass accessToken.' 
+        message: errorMsg 
       }), { status: 400 });
     }
     if (!templateId || !signer?.name || !signer?.email) {
+      const missingFields = [
+        !templateId && 'templateId',
+        !signer?.name && 'signer.name',
+        !signer?.email && 'signer.email'
+      ].filter(Boolean);
+      const errorMsg = `Missing required fields: ${missingFields.join(', ')}`;
+      logger.error(errorMsg);
+      logResponse(400, { reason: 'missing_fields', missingFields });
       return new Response(JSON.stringify({ 
         error: 'Missing data', 
-        message: 'templateId, signer.name, and signer.email are required.' 
+        message: errorMsg
       }), { status: 400 });
     }
 
@@ -103,8 +167,16 @@ export default async function handler(req: Request) {
     const cleanTemplateId = (templateId || '').trim();
     const cleanRoleName = (roleName || "Signer 1").trim();
     
+    logger.debug('Request parameters validated', {
+      templateId: cleanTemplateId.slice(0, 8),
+      roleName: cleanRoleName,
+      domain: cleanDomain,
+      signerEmail: signer.email,
+    });
+    
     let accessToken: string | undefined = providedAccessToken;
     if (!accessToken) {
+      logger.debug('Refreshing access token');
       const refreshParams = new URLSearchParams();
       refreshParams.append('refresh_token', effectiveRefreshToken);
       refreshParams.append('client_id', effectiveClientId || '');
@@ -114,7 +186,10 @@ export default async function handler(req: Request) {
       try {
         const authData = await getOAuthToken(refreshParams, cleanDomain);
         accessToken = authData.access_token;
+        logger.info('Access token refreshed successfully');
       } catch (authError: any) {
+        logger.error('Token refresh failed', authError);
+        logResponse(401, { reason: 'auth_failure', error: authError.message });
         return new Response(JSON.stringify({ 
           error: 'Authentication Failure', 
           message: authError.message,
@@ -124,25 +199,42 @@ export default async function handler(req: Request) {
     }
 
     // Fetch template to resolve the correct action_id for the requested role
+    logger.debug('Fetching template metadata', { templateId: cleanTemplateId });
     const templateInfo = await fetch(`${cleanDomain}/api/v1/templates/${cleanTemplateId}`, {
       method: 'GET',
       headers: { 'Authorization': `Zoho-oauthtoken ${accessToken}` }
     });
     if (!templateInfo.ok) {
       const txt = await templateInfo.text();
+      logger.error('Template fetch failed', { status: templateInfo.status, response: txt });
+      logResponse(400, { reason: 'template_fetch_failed' });
       return new Response(JSON.stringify({ error: 'Template fetch failed', message: txt }), { status: 400 });
     }
     const templateData = await templateInfo.json();
     const actions = templateData?.templates?.actions || [];
+    logger.debug('Template metadata retrieved', { 
+      templateId: cleanTemplateId,
+      availableRoles: actions.map((a: any) => a.role)
+    });
+    
     const matchedAction = actions.find((a: any) => (a.role || '').trim().toLowerCase() === cleanRoleName.toLowerCase());
     if (!matchedAction?.action_id) {
+      const errorMsg = `Role '${cleanRoleName}' not found in template ${cleanTemplateId}. Available roles: ${actions.map((a: any) => a.role).join(', ')}`;
+      logger.warn('Role mismatch', { requestedRole: cleanRoleName, availableRoles: actions.map((a: any) => a.role) });
+      logResponse(400, { reason: 'role_not_found' });
       return new Response(JSON.stringify({
         error: 'Role not found',
-        message: `ROLE ERROR: The role name '${cleanRoleName}' was not found in template ${cleanTemplateId}.`
+        message: errorMsg
       }), { status: 400 });
     }
 
     const endpoint = `${cleanDomain}/api/v1/templates/${cleanTemplateId}/createdocument`;
+
+    logger.debug('Creating Zoho Sign document', { 
+      templateId: cleanTemplateId, 
+      role: cleanRoleName,
+      signerName: signer.name
+    });
 
     const payload = {
       templates: {
@@ -184,12 +276,28 @@ export default async function handler(req: Request) {
     try {
       data = JSON.parse(responseText);
     } catch (e) {
+      logger.error('Failed to parse Zoho API response', { responseText });
       data = { error: "Non-JSON Response", raw: responseText };
     }
     
     if (response.status === 400 && responseText.includes("action_id")) {
-      data.debug_hint = `ROLE ERROR: The role name '${cleanRoleName}' was not found in template ${cleanTemplateId}.`;
+      data.debug_hint = `Role '${cleanRoleName}' was not found in template ${cleanTemplateId}.`;
     }
+
+    if (!response.ok) {
+      logger.error('Zoho document creation failed', { 
+        status: response.status, 
+        error: data.error,
+        message: data.message 
+      });
+      logResponse(response.status, { reason: 'zoho_api_error' });
+      return new Response(JSON.stringify(data), { status: response.status });
+    }
+
+    logger.info('Zoho document created successfully', {
+      requestId: data?.requests?.request_id,
+      templateId: cleanTemplateId
+    });
 
     // For embedded signing, make the embedtoken API call to get the proper signing URL
     if (response.ok && data.requests) {
@@ -199,10 +307,13 @@ export default async function handler(req: Request) {
       
       if (action?.action_id && request?.request_id) {
         try {
-          console.log('Making embedtoken API call...');
+          logger.debug('Fetching embed token for embedded signing', {
+            requestId: request.request_id,
+            actionId: action.action_id
+          });
+          
           const host = req.headers.get('origin') || 'https://zoho-sign-forms.vercel.app';
           const embedUrl = `${cleanDomain}/api/v1/requests/${request.request_id}/actions/${action.action_id}/embedtoken?host=${host}`;
-          console.log('Embed URL:', embedUrl);
           
           const embedResponse = await fetch(embedUrl, {
             method: 'GET',
@@ -211,29 +322,29 @@ export default async function handler(req: Request) {
           
           if (embedResponse.ok) {
             const embedData = await embedResponse.json();
-            console.log('Embed response:', embedData);
+            logger.debug('Embed token received', { hasSignUrl: !!embedData.sign_url });
             // Update the action with the embed signing URL
             if (embedData.sign_url) {
               action.signing_url = embedData.sign_url;
-              console.log('Updated signing URL from embed token:', embedData.sign_url);
+              logger.info('Signing URL updated from embed token');
             }
           } else {
-            console.log('Embed token call failed:', embedResponse.status);
+            logger.warn('Embed token request failed', { status: embedResponse.status });
           }
         } catch (embedError) {
-          console.log('Error getting embed token:', embedError);
+          logger.error('Error fetching embed token', embedError);
         }
       }
     }
+
+    logResponse(response.status, {
+      requestId: data?.requests?.request_id,
+      hasSigningUrl: !!data?.requests?.actions?.[0]?.signing_url
+    });
 
     return new Response(JSON.stringify(data), {
       status: response.status,
       headers: { 'Content-Type': 'application/json' }
     });
   } catch (error) {
-    return new Response(JSON.stringify({ 
-      error: 'Internal Server Error', 
-      message: (error as Error).message 
-    }), { status: 500 });
-  }
-}
+    logError(error, 500);
